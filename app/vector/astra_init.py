@@ -1,8 +1,9 @@
-import os, glob
+import os
 from dotenv import load_dotenv
 from astrapy import DataAPIClient
 
 load_dotenv()
+
 client = DataAPIClient()
 db = client.get_database(
     os.getenv("ASTRA_DB_API_ENDPOINT"), 
@@ -11,24 +12,31 @@ db = client.get_database(
 )
 
 name = os.getenv("ASTRA_DB_VECTOR_COLLECTION", "drilling_docs")
-dim = int(os.getenv("ASTRA_DB_VECTOR_DIM", "1024"))
 
-# Create basic vector collection
+# Create collection with vectorize enabled
 if name not in db.list_collection_names():
-    db.create_collection(
-        name, 
-        definition={
-            "vector": {"dimension": dim, "metric": "cosine"}
-        }
-    )
-    print(f"Created basic collection: {name}")
-    print("💡 Configure Vectorize manually in AstraDB console")
+    try:
+        db.create_collection(
+            name,
+            dimension=1536,
+            metric="cosine",
+            service={
+                "provider": "openai",
+                "modelName": "text-embedding-3-small"
+            }
+        )
+        print(f"✅ Created collection with vectorize: {name}")
+    except Exception as e:
+        # Fallback to basic collection
+        db.create_collection(name, dimension=1536, metric="cosine")
+        print(f"⚠️ Created basic collection: {name}")
+        print("💡 Configure Vectorize manually in AstraDB console")
 else:
-    print(f"Using existing collection: {name}")
+    print(f"✅ Collection already exists: {name}")
 
-# Insert documents
-coll = db.get_collection(name)
-for path in glob.glob("data/docs/*.md"):
-    body = open(path, "r").read()
-    coll.insert_one({"path": path, "body": body, "source": "seed"})
-print("Inserted seed docs.")
+# Test the collection
+try:
+    coll = db.get_collection(name)
+    print(f"✅ Collection accessible: {name}")
+except Exception as e:
+    print(f"❌ Collection access failed: {e}")

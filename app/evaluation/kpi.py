@@ -255,7 +255,7 @@ class KPICalculator:
             "pressure_risk": pressure_risk,
             "equipment_risk": equipment_risk,
             "formation_risk": formation_risk,
-            "overall_risk": np.mean([validation_risk, vibration_risk, pressure_risk, equipment_risk, formation_risk])
+            "overall_risk": sum([validation_risk, vibration_risk, pressure_risk, equipment_risk, formation_risk]) / 5
         }
         
         return risk_components

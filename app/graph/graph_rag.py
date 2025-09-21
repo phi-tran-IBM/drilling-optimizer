@@ -1,9 +1,28 @@
 import os
-import json  # Add this import
+import json
+import re
+from typing import List, Dict, Any
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Environment validation - fail fast if missing required variables
+def validate_environment():
+    """Validate all required environment variables are present."""
+    required_vars = [
+        "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD",
+        "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN", 
+        "ASTRA_DB_VECTOR_COLLECTION"
+    ]
+    
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        raise EnvironmentError(f"Missing required environment variables: {missing}")
+
+# Call validation on module import
+validate_environment()
+
 URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 USER = os.getenv("NEO4J_USERNAME", "neo4j") 
 PWD = os.getenv("NEO4J_PASSWORD")
@@ -12,12 +31,16 @@ PWD = os.getenv("NEO4J_PASSWORD")
 _driver = None
 
 def _get_driver():
+    """Get Neo4j driver instance."""
     global _driver
     if _driver is None:
+        if not PWD:
+            raise EnvironmentError("NEO4J_PASSWORD environment variable is required")
         _driver = GraphDatabase.driver(URI, auth=(USER, PWD))
     return _driver
 
 def _session():
+    """Get Neo4j session."""
     return _get_driver().session()
 
 def close_driver():
@@ -27,124 +50,457 @@ def close_driver():
         _driver.close()
         _driver = None
 
-def _astra_snippets(keywords: str, k: int = 3):
-    """Retrieve k short snippets from AstraDB using simple retrieval."""
+def _astra_snippets(keywords: str, k: int = 3) -> List[Dict[str, str]]:
+    """Retrieve k short snippets from AstraDB using vectorize."""
+    from astrapy import DataAPIClient
+    
+    # Validate required environment variables
+    endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
+    token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+    
+    if not endpoint or not token:
+        raise EnvironmentError("ASTRA_DB_API_ENDPOINT and ASTRA_DB_APPLICATION_TOKEN are required")
+    
+    client = DataAPIClient()
+    db = client.get_database(
+        endpoint, 
+        token=token,
+        keyspace="well_planning"
+    )
+    coll = db.get_collection(os.getenv("ASTRA_DB_VECTOR_COLLECTION", "drilling_docs"))
+    
+    # Use vectorize for semantic search
     try:
-        from astrapy import DataAPIClient
-        client = DataAPIClient()
-        db = client.get_database(
-            os.getenv("ASTRA_DB_API_ENDPOINT"), 
-            token=os.getenv("ASTRA_DB_APPLICATION_TOKEN"),
-            keyspace="well_planning"
-        )
-        coll = db.get_collection(os.getenv("ASTRA_DB_VECTOR_COLLECTION", "drilling_docs"))
-        
-        # Simple document retrieval (vectorize not configured yet)
-        items = list(coll.find({}).limit(k))
+        results = coll.find({}, 
+                          sort={"$vectorize": keywords}, 
+                          limit=k,
+                          include_similarity=True)
         
         snippets = []
-        for d in items:
-            body = d.get("body","")
-            src = d.get("path") or d.get("url")
-            if body:
-                snippet = body[:500] + ("..." if len(body) > 500 else "")
-            else:
-                snippet = "(no text extracted)"
-            snippets.append({"source": src, "snippet": snippet})
+        for d in results:
+            body = d.get("body", "")
+            src = d.get("path") or d.get("filename") or d.get("url")
+            similarity = d.get("$similarity", 0.0)
+            
+            if not body:
+                raise ValueError(f"No text content found in document: {src}")
+            
+            snippet = body[:500] + ("..." if len(body) > 500 else "")
+            snippets.append({
+                "source": src or "unknown",
+                "snippet": snippet,
+                "similarity": similarity
+            })
+        
+        if not snippets:
+            raise ValueError(f"No documents found for keywords: {keywords}")
+            
         return snippets
+        
     except Exception as e:
-        print(f"AstraDB connection failed, using fallback: {e}")
-        # Return fallback sample data
-        return [
-            {"source": "drilling_manual.pdf", "snippet": "PDC bits are recommended for sandstone formations..."},
-            {"source": "best_practices.md", "snippet": "Maintain WOB between 20-35k lbs for optimal ROP..."},
-            {"source": "vibration_guide.pdf", "snippet": "Use stabilizers to minimize lateral vibration..."}
-        ]
+        raise ConnectionError(f"AstraDB retrieval failed: {e}")
 
-def retrieve_subgraph_context(well_id: str, objectives: str) -> dict:
-    """Retrieve context for a well, with fallback if no data exists"""
+def retrieve_subgraph_context(well_id: str, objectives: str) -> Dict[str, Any]:
+    """Retrieve context for a well using GraphRAG - fails fast if no data exists."""
+    
+    # Enhanced query to get comprehensive well context
     q = """
-MATCH (w:Well {well_id:$wid})-[:HAS_FORMATION]->(f:Formation)
-WITH w, collect({name:f.name, depth:[f.depth_start,f.depth_end], rs:f.rock_strength, pp:f.pore_pressure}) AS formations
-OPTIONAL MATCH (hp:HistoricalPlan)<-[:HAS_PLAN]-(w)
-WITH w, formations, collect({plan_id:hp.plan_id, kpi:hp.final_kpi_score})[0..3] AS examples
-OPTIONAL MATCH (b:BHATool)-[:HAS_CONSTRAINT]->(c:EngineeringConstraint)
-WITH w, formations, examples, collect({part:b.part_number, type:b.tool_type, limits:c{.*}}) AS bha
-RETURN {well_id:w.well_id, formations:formations, examples:examples, bha:bha} AS ctx
-"""
+    MATCH (w:Well {well_id: $wid})
+    OPTIONAL MATCH (w)-[:HAS_FORMATION]->(f:Formation)
+    WITH w, collect({
+        name: f.name, 
+        depth: [f.depth_start, f.depth_end], 
+        rock_strength: f.rock_strength, 
+        pore_pressure: f.pore_pressure,
+        properties: properties(f)
+    }) AS formations
+    
+    OPTIONAL MATCH (w)-[:HAS_PLAN]->(hp:HistoricalPlan)
+    WITH w, formations, collect({
+        plan_id: hp.plan_id, 
+        kpi: hp.final_kpi_score,
+        drilling_days: hp.drilling_days,
+        lessons_learned: hp.lessons_learned
+    })[0..3] AS examples
+    
+    OPTIONAL MATCH (b:BHATool)-[:HAS_CONSTRAINT]->(c:EngineeringConstraint)
+    WITH w, formations, examples, collect({
+        part: b.part_number, 
+        type: b.tool_type, 
+        manufacturer: b.manufacturer,
+        limits: properties(c)
+    }) AS bha
+    
+    RETURN {
+        well_id: w.well_id,
+        location: w.location,
+        depth_target: w.depth_target,
+        formations: formations, 
+        examples: examples, 
+        bha: bha,
+        well_properties: properties(w)
+    } AS ctx
+    """
+    
     try:
         with _session() as s:
             rec = s.run(q, wid=well_id).single()
-            ctx = rec["ctx"] if rec else None
+            if not rec or not rec["ctx"]:
+                raise ValueError(f"No data found for well_id: {well_id}")
+            
+            ctx = rec["ctx"]
     except Exception as e:
-        print(f"Neo4j query failed, using fallback: {e}")
-        ctx = None
+        if "No data found" in str(e):
+            raise
+        else:
+            raise ConnectionError(f"Neo4j query failed: {e}")
     
-    # Enhanced fallback with sample data
-    if not ctx:
-        ctx = {
-            "well_id": well_id,
-            "formations": [
-                {"name": "Sandstone_A", "depth": [0, 5000], "rs": 25000, "pp": 0.45},
-                {"name": "Shale_B", "depth": [5000, 10000], "rs": 35000, "pp": 0.52}
-            ],
-            "examples": [
-                {"plan_id": "HIST_001", "kpi": 85.2},
-                {"plan_id": "HIST_002", "kpi": 78.9}
-            ],
-            "bha": [
-                {"part": "PDC-001", "type": "PDC_Bit", "limits": {"max_wob": 40000, "max_rpm": 150}}
-            ]
-        }
+    # Validate critical data is present
+    if not ctx.get("well_id"):
+        raise ValueError(f"Invalid well data retrieved for: {well_id}")
     
+    if not ctx.get("formations"):
+        raise ValueError(f"No formation data found for well: {well_id}")
+    
+    # Add objectives to context
     ctx["objectives"] = objectives
-    form_names = ", ".join([f.get("name","") for f in ctx.get("formations", [])])
-    keywords = (form_names + " " + objectives).strip() or well_id
     
-    # Get document snippets
-    ctx["docs"] = _astra_snippets(keywords, k=3)
+    # Create enhanced keywords for vector search
+    form_names = ", ".join([f.get("name", "") for f in ctx.get("formations", [])])
+    well_location = ctx.get("location", "")
+    keywords = f"{form_names} {well_location} {objectives}".strip()
+    
+    if not keywords:
+        keywords = well_id
+    
+    # Get document snippets using GraphRAG approach
+    try:
+        ctx["docs"] = _astra_snippets(keywords, k=5)
+    except Exception as e:
+        raise ConnectionError(f"Document retrieval failed: {e}")
+    
+    # Add metadata for transparency
+    ctx["retrieval_metadata"] = {
+        "search_keywords": keywords,
+        "formations_count": len(ctx.get("formations", [])),
+        "historical_examples_count": len(ctx.get("examples", [])),
+        "bha_tools_count": len(ctx.get("bha", [])),
+        "documents_retrieved": len(ctx.get("docs", []))
+    }
     
     return ctx
 
-def validate_against_constraints(well_id: str, plan_text: str) -> dict:
-    """Validate plan against constraints"""
-    # For now, using demo validation with some variability
-    import random
-    import hashlib
+def validate_against_constraints(well_id: str, plan_text: str) -> Dict[str, Any]:
+    """Validate plan against real engineering constraints from knowledge graph."""
     
-    # Use hash of plan_text for consistent results
-    plan_hash = int(hashlib.md5(plan_text.encode()).hexdigest(), 16) % 100
-    passes = plan_hash > 30  # 70% pass rate
+    # Extract parameters from plan text using structured parsing
+    from app.llm.watsonx_client import parse_markdown_plan
     
-    if passes:
-        return {
-            "passes": True, 
-            "violations": [],  # CHANGE: Return empty list instead of 0
-            "details": "All constraints satisfied",
-            "checked_constraints": ["pressure", "vibration", "torque"],
-            "confidence": 0.9  # ADD: For enhanced KPI
-        }
-    else:
-        violations_count = 1 + (plan_hash % 3)  # 1-3 violations
-        violation_list = [  # CHANGE: Return list of violation descriptions
-            "Pressure exceeds maximum limit (5200 > 5000 psi)",
-            "Vibration level critical (3.2 > 2.5 g)",
-            "Torque limit exceeded (8500 > 8000 ft-lbs)"
-        ][:violations_count]
+    parsed_plan = parse_markdown_plan(plan_text)
+    if parsed_plan.get("parsing_error"):
+        raise ValueError(f"Cannot parse plan for validation: {parsed_plan['parsing_error']}")
+    
+    violations = []
+    checked_constraints = []
+    violation_details = []
+    
+    # Get constraints from Neo4j with enhanced query
+    q = """
+    MATCH (w:Well {well_id: $well_id})-[:HAS_FORMATION]->(f:Formation)
+    MATCH (b:BHATool)-[:HAS_CONSTRAINT]->(c:EngineeringConstraint)
+    RETURN DISTINCT
+        f.name as formation, 
+        f.pore_pressure as pp, 
+        f.rock_strength as rs,
+        b.part_number as tool_part,
+        b.tool_type as tool_type,
+        c.constraint_id as constraint_id, 
+        c.constraint_type as constraint_type, 
+        c.limit_value as limit_value, 
+        c.unit as unit,
+        c.description as description
+    """
+    
+    try:
+        with _session() as s:
+            constraints = list(s.run(q, well_id=well_id))
+    except Exception as e:
+        raise ConnectionError(f"Failed to retrieve constraints from Neo4j: {e}")
+    
+    if not constraints:
+        raise ValueError(f"No constraints found for well: {well_id}")
+    
+    # Validate each constraint against plan parameters
+    for constraint in constraints:
+        constraint_id = constraint["constraint_id"]
+        constraint_type = constraint["constraint_type"]
+        limit_value = float(constraint["limit_value"])
+        unit = constraint["unit"]
         
-        return {
-            "passes": False, 
-            "violations": violation_list,  # CHANGE: List instead of count
-            "details": f"Found {violations_count} constraint violation(s)",
-            "checked_constraints": ["pressure", "vibration", "torque"],
-            "violation_details": [
-                {"type": "pressure", "severity": "warning", "value": 5200, "limit": 5000},
-                {"type": "vibration", "severity": "critical", "value": 3.2, "limit": 2.5}
-            ][:violations_count],
-            "confidence": 0.3  # ADD: For enhanced KPI
-        }
+        checked_constraints.append(constraint_id)
+        
+        # Pressure constraints
+        if constraint_type == "pressure":
+            mud_weights = extract_mud_weights(parsed_plan)
+            for mw in mud_weights:
+                if mw.get("value", 0) > limit_value:
+                    violation_msg = f"Mud weight {mw['value']} {mw.get('unit', 'ppg')} exceeds limit {limit_value} {unit}"
+                    violations.append(violation_msg)
+                    violation_details.append({
+                        "type": "pressure",
+                        "constraint_id": constraint_id,
+                        "actual_value": mw['value'],
+                        "limit_value": limit_value,
+                        "unit": unit,
+                        "severity": "high" if mw['value'] > limit_value * 1.2 else "medium"
+                    })
+        
+        # Torque constraints
+        elif constraint_type == "torque":
+            torque_values = extract_torque_values(parsed_plan)
+            for tv in torque_values:
+                if tv.get("value", 0) > limit_value:
+                    violation_msg = f"Torque {tv['value']} {tv.get('unit', 'ft-lbs')} exceeds limit {limit_value} {unit}"
+                    violations.append(violation_msg)
+                    violation_details.append({
+                        "type": "torque",
+                        "constraint_id": constraint_id,
+                        "actual_value": tv['value'],
+                        "limit_value": limit_value,
+                        "unit": unit,
+                        "severity": "high" if tv['value'] > limit_value * 1.1 else "medium"
+                    })
+        
+        # Rotation/RPM constraints
+        elif constraint_type in ["rotation", "speed"]:
+            rpm_values = extract_rpm_values(parsed_plan)
+            for rpm in rpm_values:
+                if rpm.get("value", 0) > limit_value:
+                    violation_msg = f"RPM {rpm['value']} {rpm.get('unit', 'rpm')} exceeds limit {limit_value} {unit}"
+                    violations.append(violation_msg)
+                    violation_details.append({
+                        "type": "rotation",
+                        "constraint_id": constraint_id,
+                        "actual_value": rpm['value'],
+                        "limit_value": limit_value,
+                        "unit": unit,
+                        "severity": "medium"
+                    })
+        
+        # Force/WOB constraints
+        elif constraint_type == "force":
+            wob_values = extract_wob_values(parsed_plan)
+            for wob in wob_values:
+                if wob.get("value", 0) > limit_value:
+                    violation_msg = f"WOB {wob['value']} {wob.get('unit', 'lbs')} exceeds limit {limit_value} {unit}"
+                    violations.append(violation_msg)
+                    violation_details.append({
+                        "type": "force",
+                        "constraint_id": constraint_id,
+                        "actual_value": wob['value'],
+                        "limit_value": limit_value,
+                        "unit": unit,
+                        "severity": "high" if wob['value'] > limit_value * 1.15 else "medium"
+                    })
+    
+    # Calculate confidence based on constraint coverage and violation severity
+    high_severity_count = sum(1 for v in violation_details if v.get("severity") == "high")
+    confidence = 0.9 if len(violations) == 0 else max(0.1, 0.9 - (len(violations) * 0.1) - (high_severity_count * 0.1))
+    
+    return {
+        "passes": len(violations) == 0,
+        "violations": violations,
+        "violation_details": violation_details,
+        "details": f"Checked {len(checked_constraints)} constraints across {len(set(c['constraint_type'] for c in constraints))} types",
+        "checked_constraints": checked_constraints,
+        "constraint_types_checked": list(set(c["constraint_type"] for c in constraints)),
+        "confidence": round(confidence, 2),
+        "total_constraints": len(constraints),
+        "high_severity_violations": high_severity_count
+    }
 
-def record_iteration(plan_id: str, iteration: int, draft: str, validation: dict, kpis: dict):
+def extract_mud_weights(parsed_plan: Dict) -> List[Dict[str, Any]]:
+    """Extract mud weight values from parsed plan."""
+    mud_weights = []
+    
+    # Check parameters section
+    for param in parsed_plan.get("parameters", []):
+        if "mud_weight" in param:
+            mw_str = param["mud_weight"]
+            try:
+                # Parse value and unit from string like "12.5 ppg"
+                parts = mw_str.split()
+                value = float(parts[0])
+                unit = parts[1] if len(parts) > 1 else "ppg"
+                mud_weights.append({"value": value, "unit": unit, "section": param.get("section", "unknown")})
+            except (ValueError, IndexError):
+                continue
+    
+    # Also search in plan text
+    plan_text = parsed_plan.get("plan_text", "")
+    mud_weight_patterns = [
+        r"mud weight[:\s]*(\d+\.?\d*)\s*([a-zA-Z]*)",
+        r"(\d+\.?\d*)\s*ppg",
+        r"density[:\s]*(\d+\.?\d*)\s*([a-zA-Z]*)"
+    ]
+    
+    for pattern in mud_weight_patterns:
+        matches = re.findall(pattern, plan_text, re.IGNORECASE)
+        for match in matches:
+            try:
+                if isinstance(match, tuple):
+                    value = float(match[0])
+                    unit = match[1] if len(match) > 1 and match[1] else "ppg"
+                else:
+                    value = float(match)
+                    unit = "ppg"
+                
+                # Filter reasonable mud weight values (8-20 ppg typical)
+                if 6 <= value <= 25:
+                    mud_weights.append({"value": value, "unit": unit, "section": "text_extraction"})
+            except (ValueError, IndexError):
+                continue
+    
+    return mud_weights
+
+def extract_torque_values(parsed_plan: Dict) -> List[Dict[str, Any]]:
+    """Extract torque values from parsed plan."""
+    torque_values = []
+    
+    # Check parameters section
+    for param in parsed_plan.get("parameters", []):
+        for key, value in param.items():
+            if "torque" in key.lower() and isinstance(value, str):
+                try:
+                    # Parse value and unit from string like "7500 ft-lbs"
+                    parts = value.split()
+                    if len(parts) >= 1:
+                        torque_val = float(parts[0])
+                        unit = " ".join(parts[1:]) if len(parts) > 1 else "ft-lbs"
+                        torque_values.append({"value": torque_val, "unit": unit, "section": param.get("section", "unknown")})
+                except (ValueError, IndexError):
+                    continue
+    
+    # Search in plan text for torque mentions
+    plan_text = parsed_plan.get("plan_text", "")
+    torque_patterns = [
+        r"torque[:\s]*(\d+\.?\d*)\s*([a-zA-Z\-\s]*)",
+        r"(\d+\.?\d*)\s*ft-?lbs?",
+        r"max\s*torque[:\s]*(\d+\.?\d*)\s*([a-zA-Z\-\s]*)"
+    ]
+    
+    for pattern in torque_patterns:
+        matches = re.findall(pattern, plan_text, re.IGNORECASE)
+        for match in matches:
+            try:
+                if isinstance(match, tuple):
+                    value = float(match[0])
+                    unit = match[1].strip() if len(match) > 1 and match[1] else "ft-lbs"
+                else:
+                    value = float(match)
+                    unit = "ft-lbs"
+                
+                # Filter reasonable torque values (100-15000 ft-lbs typical)
+                if 50 <= value <= 20000:
+                    torque_values.append({"value": value, "unit": unit, "section": "text_extraction"})
+            except (ValueError, IndexError):
+                continue
+    
+    return torque_values
+
+def extract_rpm_values(parsed_plan: Dict) -> List[Dict[str, Any]]:
+    """Extract RPM values from parsed plan."""
+    rpm_values = []
+    
+    # Check parameters section
+    for param in parsed_plan.get("parameters", []):
+        if "rpm" in param:
+            rpm_str = param["rpm"]
+            try:
+                parts = rpm_str.split()
+                value = float(parts[0])
+                unit = parts[1] if len(parts) > 1 else "rpm"
+                rpm_values.append({"value": value, "unit": unit, "section": param.get("section", "unknown")})
+            except (ValueError, IndexError):
+                continue
+    
+    # Search in plan text
+    plan_text = parsed_plan.get("plan_text", "")
+    rpm_patterns = [
+        r"rpm[:\s]*(\d+\.?\d*)",
+        r"(\d+\.?\d*)\s*rpm",
+        r"rotation[:\s]*(\d+\.?\d*)\s*rpm"
+    ]
+    
+    for pattern in rpm_patterns:
+        matches = re.findall(pattern, plan_text, re.IGNORECASE)
+        for match in matches:
+            try:
+                value = float(match)
+                # Filter reasonable RPM values (20-300 typical)
+                if 10 <= value <= 500:
+                    rpm_values.append({"value": value, "unit": "rpm", "section": "text_extraction"})
+            except (ValueError, IndexError):
+                continue
+    
+    return rpm_values
+
+def extract_wob_values(parsed_plan: Dict) -> List[Dict[str, Any]]:
+    """Extract WOB (Weight on Bit) values from parsed plan."""
+    wob_values = []
+    
+    # Check parameters section
+    for param in parsed_plan.get("parameters", []):
+        if "wob" in param:
+            wob_str = param["wob"]
+            try:
+                # Handle values like "35 klbs" or "35000 lbs"
+                parts = wob_str.split()
+                value = float(parts[0])
+                unit = parts[1] if len(parts) > 1 else "lbs"
+                
+                # Convert klbs to lbs for comparison
+                if unit.lower() == "klbs":
+                    value *= 1000
+                    unit = "lbs"
+                
+                wob_values.append({"value": value, "unit": unit, "section": param.get("section", "unknown")})
+            except (ValueError, IndexError):
+                continue
+    
+    # Search in plan text
+    plan_text = parsed_plan.get("plan_text", "")
+    wob_patterns = [
+        r"wob[:\s]*(\d+\.?\d*)\s*([a-zA-Z]*)",
+        r"weight on bit[:\s]*(\d+\.?\d*)\s*([a-zA-Z]*)",
+        r"(\d+\.?\d*)\s*k?lbs"
+    ]
+    
+    for pattern in wob_patterns:
+        matches = re.findall(pattern, plan_text, re.IGNORECASE)
+        for match in matches:
+            try:
+                if isinstance(match, tuple):
+                    value = float(match[0])
+                    unit = match[1] if len(match) > 1 and match[1] else "lbs"
+                else:
+                    value = float(match)
+                    unit = "lbs"
+                
+                # Convert klbs to lbs
+                if unit.lower() == "klbs":
+                    value *= 1000
+                    unit = "lbs"
+                
+                # Filter reasonable WOB values (5000-60000 lbs typical)
+                if 1000 <= value <= 80000:
+                    wob_values.append({"value": value, "unit": unit, "section": "text_extraction"})
+            except (ValueError, IndexError):
+                continue
+    
+    return wob_values
+
+def record_iteration(plan_id: str, iteration: int, draft: str, validation: Dict, kpis: Dict) -> None:
     """Record planning iteration in Neo4j with proper data types"""
     
     # Convert complex objects to JSON strings for Neo4j storage
@@ -158,8 +514,9 @@ def record_iteration(plan_id: str, iteration: int, draft: str, validation: dict,
         p.kpis_json = $kpis_json, 
         p.ts = timestamp(),
         p.passes = $passes,
-        p.violations = $violations,
-        p.total_score = $total_score
+        p.violations_count = $violations_count,
+        p.total_score = $total_score,
+        p.confidence = $confidence
     """
     
     try:
@@ -167,15 +524,16 @@ def record_iteration(plan_id: str, iteration: int, draft: str, validation: dict,
             s.run(q, 
                 pid=plan_id, 
                 iter=iteration, 
-                draft=draft[:1000],  # Truncate long drafts
+                draft=draft[:2000],  # Truncate very long drafts
                 validation_json=validation_json,
                 kpis_json=kpis_json,
                 passes=validation.get("passes", False),
-                violations=validation.get("violations", 0),
-                total_score=kpis.get("kpi_overall", 0.0) if kpis else 0.0  # CHANGE: Use kpi_overall instead of overall
+                violations_count=len(validation.get("violations", [])),
+                total_score=kpis.get("kpi_overall", 0.0) if kpis else 0.0,
+                confidence=validation.get("confidence", 0.0)
             )
     except Exception as e:
-        print(f"Failed to record iteration in Neo4j: {e}")
+        raise ConnectionError(f"Failed to record iteration in Neo4j: {e}")
 
 def initialize_schema():
     """Initialize the Neo4j schema - run this once after setting up local Neo4j"""
@@ -183,11 +541,15 @@ def initialize_schema():
         # Create constraints
         "CREATE CONSTRAINT well_id_unique IF NOT EXISTS FOR (w:Well) REQUIRE w.well_id IS UNIQUE",
         "CREATE CONSTRAINT plan_iteration_unique IF NOT EXISTS FOR (p:PlanIteration) REQUIRE (p.plan_id, p.iter) IS UNIQUE",
+        "CREATE CONSTRAINT bha_tool_unique IF NOT EXISTS FOR (b:BHATool) REQUIRE b.part_number IS UNIQUE",
+        "CREATE CONSTRAINT constraint_unique IF NOT EXISTS FOR (c:EngineeringConstraint) REQUIRE c.constraint_id IS UNIQUE",
         
         # Create indexes
         "CREATE INDEX formation_name IF NOT EXISTS FOR (f:Formation) ON (f.name)",
         "CREATE INDEX bha_tool_type IF NOT EXISTS FOR (b:BHATool) ON (b.tool_type)",
         "CREATE INDEX plan_iteration_ts IF NOT EXISTS FOR (p:PlanIteration) ON (p.ts)",
+        "CREATE INDEX constraint_type IF NOT EXISTS FOR (c:EngineeringConstraint) ON (c.constraint_type)",
+        "CREATE INDEX well_location IF NOT EXISTS FOR (w:Well) ON (w.location)",
     ]
     
     try:
@@ -196,7 +558,7 @@ def initialize_schema():
                 s.run(query)
         print("✅ Neo4j schema initialized successfully")
     except Exception as e:
-        print(f"❌ Schema initialization failed: {e}")
+        raise ConnectionError(f"Schema initialization failed: {e}")
 
 def load_sample_data():
     """Load sample data into Neo4j"""
@@ -205,28 +567,33 @@ def load_sample_data():
         "MATCH (n) DETACH DELETE n",
         
         # Create sample well
-        """CREATE (w:Well {well_id: 'WELL_001', location: 'Texas', depth_target: 10000})""",
+        """CREATE (w:Well {well_id: 'WELL_001', location: 'Permian Basin, Texas', depth_target: 10000, well_type: 'Horizontal'})""",
         
         # Create sample formations
-        """CREATE (f1:Formation {name: 'Sandstone_A', depth_start: 0, depth_end: 5000, rock_strength: 25000, pore_pressure: 0.45})""",
-        """CREATE (f2:Formation {name: 'Shale_B', depth_start: 5000, depth_end: 10000, rock_strength: 35000, pore_pressure: 0.52})""",
+        """CREATE (f1:Formation {name: 'Sandstone_A', depth_start: 0, depth_end: 5000, rock_strength: 25000, pore_pressure: 0.45, formation_type: 'Sandstone'})""",
+        """CREATE (f2:Formation {name: 'Shale_B', depth_start: 5000, depth_end: 10000, rock_strength: 35000, pore_pressure: 0.52, formation_type: 'Shale'})""",
         
         # Create sample BHA tools
-        """CREATE (b1:BHATool {part_number: 'PDC-001', tool_type: 'PDC_Bit', manufacturer: 'Baker Hughes'})""",
-        """CREATE (b2:BHATool {part_number: 'MWD-001', tool_type: 'MWD', manufacturer: 'Halliburton'})""",
+        """CREATE (b1:BHATool {part_number: 'PDC-001', tool_type: 'PDC_Bit', manufacturer: 'Baker Hughes', diameter: 8.5, specifications: 'High performance PDC bit for hard formations'})""",
+        """CREATE (b2:BHATool {part_number: 'MWD-001', tool_type: 'MWD', manufacturer: 'Halliburton', specifications: 'Measurement while drilling tool'})""",
+        """CREATE (b3:BHATool {part_number: 'MOTOR-001', tool_type: 'Motor', manufacturer: 'Schlumberger', specifications: 'Positive displacement motor'})""",
         
-        # Create sample constraints
-        """CREATE (c1:EngineeringConstraint {constraint_id: 'MAX_WOB', constraint_type: 'Force', limit_value: 40000, unit: 'lbs'})""",
-        """CREATE (c2:EngineeringConstraint {constraint_id: 'MAX_RPM', constraint_type: 'Speed', limit_value: 150, unit: 'rpm'})""",
+        # Create sample constraints with proper types
+        """CREATE (c1:EngineeringConstraint {constraint_id: 'MAX_PRESSURE', constraint_type: 'pressure', limit_value: 5000, unit: 'psi', description: 'Maximum allowable wellbore pressure'})""",
+        """CREATE (c2:EngineeringConstraint {constraint_id: 'MAX_RPM', constraint_type: 'rotation', limit_value: 150, unit: 'rpm', description: 'Maximum rotary speed'})""",
+        """CREATE (c3:EngineeringConstraint {constraint_id: 'MAX_TORQUE', constraint_type: 'torque', limit_value: 8000, unit: 'ft-lbs', description: 'Maximum allowable torque'})""",
+        """CREATE (c4:EngineeringConstraint {constraint_id: 'MAX_WOB', constraint_type: 'force', limit_value: 40000, unit: 'lbs', description: 'Maximum weight on bit'})""",
         
         # Create historical plans
-        """CREATE (hp1:HistoricalPlan {plan_id: 'HIST_001', final_kpi_score: 85.2, drilling_days: 12.5})""",
-        """CREATE (hp2:HistoricalPlan {plan_id: 'HIST_002', final_kpi_score: 78.9, drilling_days: 15.2})""",
+        """CREATE (hp1:HistoricalPlan {plan_id: 'HIST_001', final_kpi_score: 85.2, drilling_days: 12.5, lessons_learned: 'Optimal RPM for this formation is 120-140'})""",
+        """CREATE (hp2:HistoricalPlan {plan_id: 'HIST_002', final_kpi_score: 78.9, drilling_days: 15.2, lessons_learned: 'Increase mud weight gradually to prevent circulation losses'})""",
         
         # Create relationships
         """MATCH (w:Well {well_id: 'WELL_001'}), (f1:Formation {name: 'Sandstone_A'}) CREATE (w)-[:HAS_FORMATION]->(f1)""",
         """MATCH (w:Well {well_id: 'WELL_001'}), (f2:Formation {name: 'Shale_B'}) CREATE (w)-[:HAS_FORMATION]->(f2)""",
         """MATCH (b:BHATool {part_number: 'PDC-001'}), (c:EngineeringConstraint {constraint_id: 'MAX_WOB'}) CREATE (b)-[:HAS_CONSTRAINT]->(c)""",
+        """MATCH (b:BHATool {part_number: 'PDC-001'}), (c:EngineeringConstraint {constraint_id: 'MAX_TORQUE'}) CREATE (b)-[:HAS_CONSTRAINT]->(c)""",
+        """MATCH (b:BHATool {part_number: 'MOTOR-001'}), (c:EngineeringConstraint {constraint_id: 'MAX_PRESSURE'}) CREATE (b)-[:HAS_CONSTRAINT]->(c)""",
         """MATCH (w:Well {well_id: 'WELL_001'}), (hp:HistoricalPlan) CREATE (w)-[:HAS_PLAN]->(hp)""",
     ]
     
@@ -236,12 +603,10 @@ def load_sample_data():
                 s.run(query)
         print("✅ Sample data loaded successfully")
     except Exception as e:
-        print(f"❌ Sample data loading failed: {e}")
-        print("   This is normal if Neo4j is not running - fallbacks will be used")
+        raise ConnectionError(f"Sample data loading failed: {e}")
 
-# Test Neo4j connection
 def test_neo4j_connection():
-    """Test Neo4j connection and initialize if working"""
+    """Test Neo4j connection - fails fast if unavailable"""
     try:
         with _session() as s:
             result = s.run("RETURN 'Neo4j Connected' as message")
@@ -249,17 +614,41 @@ def test_neo4j_connection():
             print(f"✅ Neo4j connection successful: {record['message']}")
             return True
     except Exception as e:
-        print(f"⚠️  Neo4j connection failed: {e}")
-        print("   Using fallback data - this is normal for development")
-        return False
+        raise ConnectionError(f"Neo4j connection failed: {e}")
+
+def get_well_statistics():
+    """Get statistics about wells in the knowledge graph."""
+    q = """
+    MATCH (w:Well)
+    OPTIONAL MATCH (w)-[:HAS_FORMATION]->(f:Formation)
+    OPTIONAL MATCH (w)-[:HAS_PLAN]->(hp:HistoricalPlan)
+    RETURN 
+        count(DISTINCT w) as total_wells,
+        count(DISTINCT f) as total_formations,
+        count(DISTINCT hp) as total_historical_plans,
+        collect(DISTINCT w.well_id)[0..5] as sample_well_ids
+    """
+    
+    try:
+        with _session() as s:
+            result = s.run(q).single()
+            return dict(result) if result else {}
+    except Exception as e:
+        raise ConnectionError(f"Failed to get well statistics: {e}")
 
 if __name__ == "__main__":
     # Test connection and optionally load data
-    if test_neo4j_connection():
+    try:
+        test_neo4j_connection()
+        stats = get_well_statistics()
+        print(f"📊 Knowledge Graph Stats: {stats}")
+        
         print("\nDo you want to initialize schema and load sample data? (y/n): ", end="")
         response = input().lower().strip()
         if response == 'y':
             initialize_schema()
             load_sample_data()
-    else:
-        print("Skipping Neo4j setup - fallback mode will be used")
+            print("🎉 Setup complete!")
+    except Exception as e:
+        print(f"❌ Setup failed: {e}")
+        exit(1)
