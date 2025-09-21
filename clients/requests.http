@@ -1,0 +1,9 @@
+### Run a plan
+POST http://localhost:8008/plan/run
+Content-Type: application/json
+
+{
+  "well_id": "W-1001",
+  "objectives": "Minimize cost and vibration while achieving target ROP",
+  "max_loops": 3
+}

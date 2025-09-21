@@ -1,0 +1,2 @@
+- Expect higher pore pressures; adjust mud weight.
+- Control RPM to avoid torsional vibration.

@@ -1,0 +1,2 @@
+- Reduce RPM and increase WOB slightly to move out of stick-slip.
+- Consider a motor with higher torque at lower RPM.
