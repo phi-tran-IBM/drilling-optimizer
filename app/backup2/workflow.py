@@ -12,7 +12,7 @@ Key Features:
 - Production-ready logging and monitoring
 - Constraint satisfaction loop with KPI evaluation
 - Markdown-based LLM generation for improved reliability
-- NO FALLBACK MECHANISMS - fails fast when dependencies unavailable
+- No fallback mechanisms - fails fast when dependencies unavailable
 
 Author: Well Planning System
 Version: 3.0.0
@@ -35,42 +35,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment validation at module level - STRICT MODE
+# Environment validation at module level
 def validate_workflow_environment():
-    """Validate workflow-specific environment variables - STRICT VALIDATION."""
+    """Validate workflow-specific environment variables."""
     required_vars = [
         "WX_API_KEY", "WX_PROJECT_ID",  # Watson X AI
         "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD",  # Neo4j
-        "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN",  # AstraDB
-        "GRAPH_WEIGHT", "ASTRA_WEIGHT", "MAX_LOOPS"  # Required workflow parameters
+        "ASTRA_DB_API_ENDPOINT", "ASTRA_DB_APPLICATION_TOKEN"  # AstraDB
     ]
     
     missing = [var for var in required_vars if not os.getenv(var)]
     if missing:
         raise EnvironmentError(f"Missing required environment variables for workflow: {missing}")
 
-    # Validate weights are numeric
-    graph_weight_str = os.environ["GRAPH_WEIGHT"]
-    astra_weight_str = os.environ["ASTRA_WEIGHT"]
-    max_loops_str = os.environ["MAX_LOOPS"]
-    
-    try:
-        float(graph_weight_str)
-    except ValueError:
-        raise EnvironmentError(f"GRAPH_WEIGHT must be numeric, got: {graph_weight_str}")
-    
-    try:
-        float(astra_weight_str)
-    except ValueError:
-        raise EnvironmentError(f"ASTRA_WEIGHT must be numeric, got: {astra_weight_str}")
-    
-    try:
-        int(max_loops_str)
-    except ValueError:
-        raise EnvironmentError(f"MAX_LOOPS must be integer, got: {max_loops_str}")
-
-# Call validation on import - CRITICAL FOR FAIL-FAST
-#validate_workflow_environment()
+# Validate environment on import
+validate_workflow_environment()
 
 class PlanState(TypedDict):
     """
@@ -96,22 +75,13 @@ class PlanState(TypedDict):
     performance_metrics: Optional[Dict[str, Any]]
 
 
-def _validate_state_structure(state: PlanState, required_keys: List[str]) -> None:
-    """
-    Validate that state contains all required keys - fail fast if missing
-    """
-    missing_keys = [key for key in required_keys if key not in state]
-    if missing_keys:
-        raise KeyError(f"State missing required keys: {missing_keys}")
-
-
 def node_retrieve(state: PlanState) -> PlanState:
     """
     Retrieve contextual information for well planning using GraphRAG.
     
     This node implements the enhanced knowledge retrieval described in the project
     documentation, combining Neo4j graph traversal with vector search from AstraDB.
-    Fails fast if dependencies are unavailable - NO FALLBACK BEHAVIOR.
+    Fails fast if dependencies are unavailable.
     
     Args:
         state: Current planning state
@@ -124,16 +94,13 @@ def node_retrieve(state: PlanState) -> PlanState:
         ValueError: If no data found for well_id
     """
     try:
-        # Validate required state keys
-        _validate_state_structure(state, ["well_id", "objectives"])
-        
         # Import here to avoid circular dependencies
         from app.graph.graph_rag import retrieve_subgraph_context
         
         logger.info(f"Retrieving context for well {state['well_id']} with objectives: {state['objectives']}")
         
-        # Enhanced context retrieval using GraphRAG - STRICT MODE
-        objectives = state["objectives"]
+        # Enhanced context retrieval using GraphRAG
+        objectives = state.get("objectives", "Minimize cost and vibration while maintaining ROP")
         
         # This will fail fast if Neo4j or AstraDB are unavailable
         ctx = retrieve_subgraph_context(state["well_id"], objectives)
@@ -141,38 +108,23 @@ def node_retrieve(state: PlanState) -> PlanState:
         if not ctx:
             raise ValueError(f"No context retrieved for well {state['well_id']}")
         
-        # STRICT validation - no graceful degradation
-        if "formations" not in ctx:
-            raise ValueError(f"No formation data found for well {state['well_id']}")
-        
-        if "docs" not in ctx:
-            raise ValueError(f"No document context found for well {state['well_id']}")
-        
-        if "examples" not in ctx:
-            raise ValueError(f"No examples data found for well {state['well_id']}")
-        
-        # Validate required context fields
-        formations_count = len(ctx["formations"])
-        docs_count = len(ctx["docs"])
-        examples_count = len(ctx["examples"])
+        # Validate retrieved context quality
+        formations_count = len(ctx.get("formations", []))
+        docs_count = len(ctx.get("docs", []))
         
         if formations_count == 0:
-            raise ValueError(f"Zero formations found for well {state['well_id']}")
+            raise ValueError(f"No formation data found for well {state['well_id']}")
         
         if docs_count == 0:
-            raise ValueError(f"Zero documents found for well {state['well_id']}")
+            logger.warning(f"No documents found for well {state['well_id']} - may impact plan quality")
         
         # Update state with retrieved context
         state = dict(state)  # Create a copy to avoid mutation issues
         state["context"] = ctx
-        
-        if "retrieval_metadata" not in ctx:
-            raise ValueError("Missing retrieval metadata from context")
-        
-        state["retrieval_metadata"] = ctx["retrieval_metadata"]
+        state["retrieval_metadata"] = ctx.get("retrieval_metadata", {})
         
         logger.info(f"Successfully retrieved context: {formations_count} formations, {docs_count} docs, "
-                   f"{examples_count} historical examples")
+                   f"{len(ctx.get('examples', []))} historical examples")
         
         return state
         
@@ -202,9 +154,6 @@ def node_draft(state: PlanState) -> PlanState:
         ConnectionError: If watsonx.ai API is unavailable
     """
     try:
-        # Validate required state keys
-        _validate_state_structure(state, ["well_id", "objectives", "context", "loop"])
-        
         # Import here to avoid circular dependencies
         from app.llm.watsonx_client import generate_drilling_plan_markdown, parse_markdown_plan
         
@@ -215,34 +164,22 @@ def node_draft(state: PlanState) -> PlanState:
             logger.warning(f"Skipping draft generation due to previous error: {state['error']}")
             return state
         
-        # STRICT validation - no fallback values
-        context = state["context"]
-        objectives = state["objectives"]
+        # Get weight configuration for evidence sources
+        graph_weight = float(os.getenv("GRAPH_WEIGHT", "0.7"))
+        astra_weight = float(os.getenv("ASTRA_WEIGHT", "0.3"))
         
-        # Get weight configuration - STRICT validation required
-        graph_weight = float(os.environ["GRAPH_WEIGHT"])
-        astra_weight = float(os.environ["ASTRA_WEIGHT"])
-        
-        # Validate weights sum appropriately
-        total_weight = graph_weight + astra_weight
-        if abs(total_weight - 1.0) > 0.1:
-            logger.warning(f"Weights don't sum to 1.0: Graph={graph_weight}, Astra={astra_weight}")
+        # Extract context and objectives
+        context = state.get("context", {})
+        objectives = state.get("objectives", "Minimize cost and risk")
         
         # Add iteration context for refinement
-        if state["loop"] > 0:
-            if "validation" not in state:
-                raise ValueError("Previous validation data missing for iteration")
-            
-            previous_validation = state["validation"]
-            
-            if "violations" not in previous_validation:
-                raise ValueError("Previous validation missing violations data")
-            
-            if previous_validation["violations"]:
+        if state.get("loop", 0) > 0:
+            previous_validation = state.get("validation", {})
+            if previous_validation.get("violations"):
                 context["previous_violations"] = previous_validation["violations"]
                 context["iteration_number"] = state["loop"]
         
-        # Generate markdown-formatted drilling plan - STRICT MODE
+        # Generate markdown-formatted drilling plan
         try:
             markdown_plan = generate_drilling_plan_markdown(
                 context=context,
@@ -253,32 +190,27 @@ def node_draft(state: PlanState) -> PlanState:
         except Exception as e:
             raise ConnectionError(f"watsonx.ai generation failed: {e}")
         
-        if not markdown_plan:
-            raise ValueError("Generated plan is empty")
+        if not markdown_plan or len(markdown_plan.strip()) < 100:
+            raise ValueError("Generated plan is too short or empty")
         
-        if len(markdown_plan.strip()) < 100:
-            raise ValueError(f"Generated plan is too short: {len(markdown_plan)} characters")
-        
-        # Parse markdown plan to structured data - STRICT validation
+        # Parse markdown plan to structured data for compatibility
         try:
             parsed_plan = parse_markdown_plan(markdown_plan)
         except Exception as e:
             raise ValueError(f"Plan parsing failed: {e}")
         
-        if not parsed_plan:
-            raise ValueError("Plan parsing returned empty result")
-        
         # Validate parsing results
         if parsed_plan.get("parsing_error"):
-            raise ValueError(f"Plan parsing error: {parsed_plan['parsing_error']}")
+            logger.warning(f"Plan parsing had issues: {parsed_plan['parsing_error']}")
+            # Continue with markdown text only if parsing fails
         
-        # Enhanced plan validation - STRICT requirements
+        # Enhanced plan validation
         required_sections = ["Plan Summary", "BHA Configuration", "Drilling Parameters"]
         missing_sections = [section for section in required_sections 
                           if section not in markdown_plan]
         
         if missing_sections:
-            raise ValueError(f"Generated plan missing required sections: {missing_sections}")
+            logger.warning(f"Generated plan missing sections: {missing_sections}")
         
         # Update state with both formats
         state = dict(state)
@@ -290,9 +222,7 @@ def node_draft(state: PlanState) -> PlanState:
             "plan_length": len(markdown_plan),
             "parsing_successful": not parsed_plan.get("parsing_error"),
             "sections_count": len(re.findall(r'^##\s+', markdown_plan, re.MULTILINE)),
-            "generation_iteration": state["loop"],
-            "graph_weight_used": graph_weight,
-            "astra_weight_used": astra_weight
+            "generation_iteration": state["loop"]
         }
         
         logger.info(f"Successfully generated draft plan ({len(markdown_plan)} characters, "
@@ -326,9 +256,6 @@ def node_validate(state: PlanState) -> PlanState:
         ConnectionError: If knowledge graph is unavailable
     """
     try:
-        # Validate required state keys
-        _validate_state_structure(state, ["well_id", "draft", "loop", "plan_id"])
-        
         # Import here to avoid circular dependencies
         from app.graph.graph_rag import validate_against_constraints, record_iteration
         from app.evaluation.kpi import compute_kpis
@@ -340,73 +267,57 @@ def node_validate(state: PlanState) -> PlanState:
             logger.warning(f"Skipping validation due to previous error: {state['error']}")
             return state
         
-        draft = state["draft"]
-        if len(draft.strip()) < 50:
-            raise ValueError("Draft plan is too short for meaningful validation")
+        if not state.get("draft"):
+            raise ValueError("No draft plan available for validation")
         
-        # Validate against engineering constraints using the knowledge graph - STRICT MODE
+        # Validate against engineering constraints using the knowledge graph
         try:
-            validation_result = validate_against_constraints(state["well_id"], draft)
+            validation_result = validate_against_constraints(state["well_id"], state["draft"])
         except Exception as e:
             raise ConnectionError(f"Constraint validation failed: {e}")
         
         if not validation_result:
             raise ValueError("Empty validation result from constraint checker")
         
-        # STRICT validation of validation result structure
-        required_validation_fields = ["passes", "violations", "confidence"]
-        missing_fields = [field for field in required_validation_fields 
-                         if field not in validation_result]
-        if missing_fields:
-            raise ValueError(f"Validation result missing fields: {missing_fields}")
-        
         # Enhanced validation result processing
-        violations = validation_result["violations"]
-        if not isinstance(violations, list):
-            raise ValueError(f"Violations must be a list, got: {type(violations)}")
+        violations = validation_result.get("violations", [])
+        violation_details = validation_result.get("violation_details", [])
         
-        # STRICT validation - no fallback creation
-        if "violation_details" not in validation_result:
-            raise ValueError("Validation result missing violation_details field")
-        
-        # Compute KPIs using the Risk-Cost Evaluator - STRICT MODE
+        # Compute KPIs using the Risk-Cost Evaluator
         try:
-            kpi_scores = compute_kpis(draft, validation_result)
+            kpi_scores = compute_kpis(state["draft"], validation_result)
         except Exception as e:
             raise ValueError(f"KPI computation failed: {e}")
         
         if not kpi_scores:
             raise ValueError("Empty KPI result from evaluator")
         
-        if not isinstance(kpi_scores, dict):
-            raise ValueError(f"KPI scores must be a dict, got: {type(kpi_scores)}")
-        
         # Record this iteration in the knowledge graph for audit trail
         try:
             record_iteration(
                 plan_id=state["plan_id"],
                 iteration=state["loop"],
-                draft=draft,
+                draft=state["draft"],
                 validation=validation_result,
                 kpis=kpi_scores
             )
         except Exception as e:
             logger.warning(f"Failed to record iteration in knowledge graph: {e}")
-            # Don't fail the validation if recording fails, but log it
+            # Don't fail the validation if recording fails
         
         # Update state
         state = dict(state)
         state["validation"] = validation_result
         state["kpis"] = kpi_scores
         
-        # Add to history for tracking - STRICT structure
+        # Add to history for tracking
         history_entry = {
             "loop": state["loop"],
-            "validation_passed": validation_result["passes"],
+            "validation_passed": validation_result.get("passes", False),
             "kpi_score": kpi_scores.get("kpi_overall", 0.0),
             "violations_count": len(violations),
             "high_severity_violations": validation_result.get("high_severity_violations", 0),
-            "confidence": validation_result["confidence"],
+            "confidence": validation_result.get("confidence", 0.0),
             "timestamp": str(uuid4())  # Simple timestamp substitute
         }
         
@@ -414,10 +325,10 @@ def node_validate(state: PlanState) -> PlanState:
             state["history"] = []
         state["history"].append(history_entry)
         
-        passes = validation_result["passes"]
+        passes = validation_result.get("passes", False)
         score = kpi_scores.get("kpi_overall", 0.0)
         violations_count = len(violations)
-        confidence = validation_result["confidence"]
+        confidence = validation_result.get("confidence", 0.0)
         
         logger.info(f"Validation complete - Passes: {passes}, Score: {score:.3f}, "
                    f"Violations: {violations_count}, Confidence: {confidence:.2f}")
@@ -453,9 +364,6 @@ def node_reflect(state: PlanState) -> PlanState:
         ConnectionError: If LLM API is unavailable
     """
     try:
-        # Validate required state keys
-        _validate_state_structure(state, ["well_id", "loop", "validation", "context", "draft"])
-        
         # Import here to avoid circular dependencies
         from app.llm.watsonx_client import generate_reflection_markdown, parse_markdown_reflection
         
@@ -466,32 +374,26 @@ def node_reflect(state: PlanState) -> PlanState:
             logger.warning(f"Skipping reflection due to previous error: {state['error']}")
             return state
         
-        validation = state["validation"]
+        validation = state.get("validation", {})
         
         # If validation passed, no reflection needed
-        if validation["passes"]:
+        if validation.get("passes", False):
             logger.info("Validation passed - no reflection needed")
             return state
         
-        # STRICT validation of required data for reflection
-        violations = validation["violations"]
-        if not violations:
-            raise ValueError("No violations found but validation failed - inconsistent state")
-        
-        if not isinstance(violations, list):
-            raise ValueError(f"Violations must be a list, got: {type(violations)}")
-        
+        # Extract validation failures and context for reflection
+        violations = validation.get("violations", ["Unknown validation failure"])
         violation_details = validation.get("violation_details", [])
-        context = state["context"]
-        current_draft = state["draft"]
+        context = state.get("context", {})
+        current_draft = state.get("draft", "")
         
         # Enhanced reflection context with previous iterations
         reflection_context = {
             "current_plan": current_draft,
             "violations": violations,
             "violation_details": violation_details,
-            "constraint_types_checked": validation["constraint_types_checked"],
-            "confidence": validation["confidence"],
+            "constraint_types_checked": validation.get("constraint_types_checked", []),
+            "confidence": validation.get("confidence", 0.0),
             "iteration": state["loop"],
             "well_context": context,
             "previous_attempts": state.get("history", [])
@@ -507,11 +409,8 @@ def node_reflect(state: PlanState) -> PlanState:
         except Exception as e:
             raise ConnectionError(f"Reflection generation failed: {e}")
         
-        if not reflection_response:
-            raise ValueError("Generated reflection is empty")
-        
-        if len(reflection_response.strip()) < 50:
-            raise ValueError(f"Generated reflection is too short: {len(reflection_response)} characters")
+        if not reflection_response or len(reflection_response.strip()) < 50:
+            raise ValueError("Generated reflection is too short or empty")
         
         # Parse the reflection for structured data if needed
         try:
@@ -533,7 +432,7 @@ def node_reflect(state: PlanState) -> PlanState:
 ### Validation Results
 - **Status**: FAILED
 - **Violations Found**: {len(violations)}
-- **Confidence**: {validation['confidence']:.2f}
+- **Confidence**: {validation.get('confidence', 0.0):.2f}
 
 ### Root Cause Analysis and Optimization Strategy
 {reflection_response}
@@ -577,34 +476,25 @@ def node_check(state: PlanState) -> PlanState:
         Updated state with incremented loop counter and convergence analysis
     """
     try:
-        # Validate required state keys
-        _validate_state_structure(state, ["well_id", "validation", "kpis", "max_loops"])
-        
         logger.info(f"Checking loop conditions for well {state['well_id']}")
         
         # Increment loop counter
         state = dict(state)
         state["loop"] += 1
         
-        # STRICT validation of state data
-        validation = state["validation"]
-        kpis = state["kpis"]
-        
         # Enhanced status logging
-        passes = validation["passes"]
-        max_loops = int(os.environ["MAX_LOOPS"])
+        validation = state.get("validation", {})
+        kpis = state.get("kpis", {})
+        passes = validation.get("passes", False)
+        max_loops = state.get("max_loops", int(os.getenv("MAX_LOOPS", "5")))
         current_loop = state["loop"]
         
         overall_kpi = kpis.get("kpi_overall", 0.0)
-        violations = validation["violations"]
-        violations_count = len(violations)
-        confidence = validation["confidence"]
+        violations_count = len(validation.get("violations", []))
+        confidence = validation.get("confidence", 0.0)
         
-        # Convergence analysis - STRICT validation
-        if "history" not in state:
-            state["history"] = []
-        
-        history = state["history"]
+        # Convergence analysis
+        history = state.get("history", [])
         convergence_info = {}
         
         if len(history) > 1:
@@ -661,27 +551,13 @@ def should_continue(state: PlanState) -> str:
         logger.error(f"Terminating workflow due to error: {state['error']}")
         return END
     
-    # STRICT validation of required state data
-    if "validation" not in state:
-        logger.error("No validation data available for continuation decision")
-        return END
-    
-    if "max_loops" not in state:
-        logger.error("max_loops not set in state")
-        return END
-    
-    if "loop" not in state:
-        logger.error("loop counter not set in state")
-        return END
-    
-    validation = state["validation"]
-    
     # Check validation status
-    validation_passed = validation["passes"]
+    validation = state.get("validation", {})
+    validation_passed = validation.get("passes", False)
     
     # Check loop limits
-    max_loops = state["max_loops"]
-    current_loop = state["loop"]
+    max_loops = state.get("max_loops", int(os.getenv("MAX_LOOPS", "5")))
+    current_loop = state.get("loop", 0)
     
     # Check convergence conditions
     convergence_info = state.get("convergence_info", {})
@@ -698,10 +574,8 @@ def should_continue(state: PlanState) -> str:
         logger.warning("Workflow complete - oscillation detected, preventing infinite loop ⚠️")
         return END
     else:
-        violations = validation["violations"]
-        violations_count = len(violations)
-        kpis = state.get("kpis", {})
-        kpi_score = kpis.get("kpi_overall", 0.0)
+        violations_count = len(validation.get("violations", []))
+        kpi_score = state.get("kpis", {}).get("kpi_overall", 0.0)
         
         logger.info(f"Continuing workflow - loop {current_loop}/{max_loops}, "
                    f"{violations_count} violations, KPI: {kpi_score:.3f} 🔄")
@@ -800,15 +674,11 @@ def run_once(
         ValueError: If input parameters are invalid
         EnvironmentError: If required services are unavailable
     """
-    # STRICT input validation
     if not well_id or not isinstance(well_id, str):
         raise ValueError("well_id must be a non-empty string")
     
-    if not objectives or not isinstance(objectives, str):
-        raise ValueError("objectives must be a non-empty string")
-    
-    if not isinstance(max_loops, int) or max_loops < 1 or max_loops > 20:
-        raise ValueError("max_loops must be an integer between 1 and 20")
+    if max_loops < 1 or max_loops > 20:
+        raise ValueError("max_loops must be between 1 and 20")
     
     try:
         logger.info(f"Starting knowledge-driven well planning workflow for well {well_id}")
@@ -824,6 +694,9 @@ def run_once(
             except ImportError:
                 logger.warning("Monitoring module not available - continuing without monitoring")
                 monitor = None
+        
+        # Set environment variable for this run
+        os.environ["MAX_LOOPS"] = str(max_loops)
         
         # Initialize planning state with enhanced metadata
         plan_id = f"plan-{uuid4()}"
@@ -867,21 +740,17 @@ def run_once(
         if monitor:
             log_file = monitor.finalize_execution(final_state, execution_time)
         
-        # STRICT validation of final state
-        if not isinstance(final_state, dict):
-            raise ValueError("Workflow returned invalid state type")
-        
         # Prepare comprehensive result
-        validation = final_state.get("validation", {})
-        success = validation.get("passes", False)
-        iterations = final_state.get("loop", 0)
+        success = final_state.get("validation", {}).get("passes", False)
+        iterations = final_state["loop"]
         kpis = final_state.get("kpis", {})
+        validation = final_state.get("validation", {})
         
         result = {
             "plan_id": final_state["plan_id"],
             "well_id": final_state["well_id"],
             "objectives": final_state["objectives"],
-            "plan": final_state.get("draft", ""),
+            "plan": final_state["draft"],
             "parsed_plan": final_state.get("parsed_plan"),
             "kpis": kpis,
             "validation": validation,

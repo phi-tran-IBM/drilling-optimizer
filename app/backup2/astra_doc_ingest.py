@@ -9,8 +9,8 @@ load_dotenv()
 
 def _collection():
     client = DataAPIClient()
-    db = client.get_database(os.environ["ASTRA_DB_API_ENDPOINT"], token=os.environ["ASTRA_DB_APPLICATION_TOKEN"])
-    return db.get_collection(os.environ["ASTRA_DB_VECTOR_COLLECTION"])
+    db = client.get_database(os.getenv("ASTRA_DB_API_ENDPOINT"), token=os.getenv("ASTRA_DB_APPLICATION_TOKEN"))
+    return db.get_collection(os.getenv("ASTRA_DB_VECTOR_COLLECTION","drilling_docs"))
 
 def _read_local(path: str):
     return read_text_any(path)

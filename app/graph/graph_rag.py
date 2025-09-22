@@ -20,11 +20,12 @@ def validate_environment():
     if missing:
         raise EnvironmentError(f"Missing required environment variables: {missing}")
 
-# Call validation on module import
+# CRITICAL: Call validation immediately on module import - THIS LINE WAS MISSING
 validate_environment()
 
-URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-USER = os.getenv("NEO4J_USERNAME", "neo4j") 
+# Now safe to get environment variables since validation passed
+URI = os.getenv("NEO4J_URI")
+USER = os.getenv("NEO4J_USERNAME") 
 PWD = os.getenv("NEO4J_PASSWORD")
 
 # Global driver instance
@@ -34,8 +35,6 @@ def _get_driver():
     """Get Neo4j driver instance."""
     global _driver
     if _driver is None:
-        if not PWD:
-            raise EnvironmentError("NEO4J_PASSWORD environment variable is required")
         _driver = GraphDatabase.driver(URI, auth=(USER, PWD))
     return _driver
 
@@ -51,26 +50,32 @@ def close_driver():
         _driver = None
 
 def _astra_snippets(keywords: str, k: int = 3) -> List[Dict[str, str]]:
-    """Retrieve k short snippets from AstraDB using vectorize."""
+    """Retrieve k short snippets from AstraDB using vectorize - STRICT MODE."""
     from astrapy import DataAPIClient
     
-    # Validate required environment variables
+    # Get validated environment variables
     endpoint = os.getenv("ASTRA_DB_API_ENDPOINT")
     token = os.getenv("ASTRA_DB_APPLICATION_TOKEN")
+    collection_name = os.getenv("ASTRA_DB_VECTOR_COLLECTION")
     
-    if not endpoint or not token:
-        raise EnvironmentError("ASTRA_DB_API_ENDPOINT and ASTRA_DB_APPLICATION_TOKEN are required")
+    # Validate server-side vectorize is enabled
+    vectorize_enabled = os.getenv("ASTRA_USE_SERVER_VECTORIZE", "false").lower()
+    if vectorize_enabled not in ["true", "1", "yes"]:
+        raise EnvironmentError(
+            "Server-side vectorize is required but not enabled. "
+            "Set ASTRA_USE_SERVER_VECTORIZE=true and enable vectorize on your collection."
+        )
     
-    client = DataAPIClient()
-    db = client.get_database(
-        endpoint, 
-        token=token,
-        keyspace="well_planning"
-    )
-    coll = db.get_collection(os.getenv("ASTRA_DB_VECTOR_COLLECTION", "drilling_docs"))
-    
-    # Use vectorize for semantic search
     try:
+        client = DataAPIClient()
+        db = client.get_database(
+            endpoint, 
+            token=token,
+            keyspace="well_planning"
+        )
+        coll = db.get_collection(collection_name)
+        
+        # Use vectorize for semantic search - this will fail if vectorize is not properly configured
         results = coll.find({}, 
                           sort={"$vectorize": keywords}, 
                           limit=k,
@@ -83,7 +88,7 @@ def _astra_snippets(keywords: str, k: int = 3) -> List[Dict[str, str]]:
             similarity = d.get("$similarity", 0.0)
             
             if not body:
-                raise ValueError(f"No text content found in document: {src}")
+                raise ValueError(f"Document has no text content: {src}")
             
             snippet = body[:500] + ("..." if len(body) > 500 else "")
             snippets.append({
@@ -98,7 +103,7 @@ def _astra_snippets(keywords: str, k: int = 3) -> List[Dict[str, str]]:
         return snippets
         
     except Exception as e:
-        raise ConnectionError(f"AstraDB retrieval failed: {e}")
+        raise ConnectionError(f"AstraDB vectorize search failed: {e}")
 
 def retrieve_subgraph_context(well_id: str, objectives: str) -> Dict[str, Any]:
     """Retrieve context for a well using GraphRAG - fails fast if no data exists."""
@@ -155,7 +160,7 @@ def retrieve_subgraph_context(well_id: str, objectives: str) -> Dict[str, Any]:
         else:
             raise ConnectionError(f"Neo4j query failed: {e}")
     
-    # Validate critical data is present
+    # Strict validation - no graceful degradation
     if not ctx.get("well_id"):
         raise ValueError(f"Invalid well data retrieved for: {well_id}")
     
@@ -173,11 +178,8 @@ def retrieve_subgraph_context(well_id: str, objectives: str) -> Dict[str, Any]:
     if not keywords:
         keywords = well_id
     
-    # Get document snippets using GraphRAG approach
-    try:
-        ctx["docs"] = _astra_snippets(keywords, k=5)
-    except Exception as e:
-        raise ConnectionError(f"Document retrieval failed: {e}")
+    # Get document snippets using GraphRAG approach - STRICT MODE
+    ctx["docs"] = _astra_snippets(keywords, k=5)
     
     # Add metadata for transparency
     ctx["retrieval_metadata"] = {

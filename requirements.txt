@@ -19,3 +19,7 @@ lxml
 numpy>=1.21.0
 scikit-learn>=1.0.0
 pyyaml
+pydantic-settings>=2.0.0
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+structlog>=23.0.0

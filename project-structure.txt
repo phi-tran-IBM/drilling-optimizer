@@ -1,0 +1,197 @@
+.
+├── README.md
+├── app
+│   ├── __pycache__
+│   │   └── main.cpython-311.pyc
+│   ├── agent
+│   │   ├── __pycache__
+│   │   │   └── workflow.cpython-311.pyc
+│   │   ├── workflow.py
+│   │   └── workflow.py.backup
+│   ├── backup2
+│   │   ├── astra_doc_ingest.py
+│   │   ├── astra_hybrid_search.py
+│   │   ├── astra_init.py
+│   │   ├── doc_parsers.py
+│   │   ├── kpi.py
+│   │   ├── main.py
+│   │   ├── paper_uploader.py
+│   │   ├── topic_suggester.py
+│   │   ├── workflow.py
+│   │   └── workflow_monitor.py
+│   ├── connectors
+│   │   ├── __pycache__
+│   │   │   ├── boem_wells.cpython-311.pyc
+│   │   │   ├── npd_wellbores.cpython-311.pyc
+│   │   │   ├── nsta_offshore_wells.cpython-311.pyc
+│   │   │   ├── rrc_loader.cpython-311.pyc
+│   │   │   └── usgs_aggregated.cpython-311.pyc
+│   │   ├── boem_wells.py
+│   │   ├── npd_wellbores.py
+│   │   ├── nsta_offshore_wells.py
+│   │   ├── rrc_loader.py
+│   │   └── usgs_aggregated.py
+│   ├── connectors.backup
+│   │   ├── __pycache__
+│   │   │   ├── boem_wells.cpython-311.pyc
+│   │   │   ├── npd_wellbores.cpython-311.pyc
+│   │   │   ├── nsta_offshore_wells.cpython-311.pyc
+│   │   │   ├── rrc_loader.cpython-311.pyc
+│   │   │   └── usgs_aggregated.cpython-311.pyc
+│   │   ├── boem_wells.py
+│   │   ├── npd_wellbores.py
+│   │   ├── nsta_offshore_wells.py
+│   │   ├── rrc_loader.py
+│   │   ├── unified_data_loader.py
+│   │   └── usgs_aggregated.py
+│   ├── core
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   └── __init__.cpython-311.pyc
+│   │   ├── config
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   └── settings.py
+│   │   ├── events
+│   │   │   └── __init__.py
+│   │   └── interfaces
+│   │       ├── __init__.py
+│   │       ├── __pycache__
+│   │       ├── knowledge_graph.py
+│   │       ├── knowledge_graph_interface.py
+│   │       ├── llm_interface.py
+│   │       ├── retrieval_interface.py
+│   │       └── validation_interface.py
+│   ├── domain
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   └── __init__.cpython-311.pyc
+│   │   ├── models
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   ├── drilliing_ontology.py
+│   │   │   └── drilling_plan.py
+│   │   ├── ontology
+│   │   │   ├── __init__.py
+│   │   │   ├── __pycache__
+│   │   │   └── drilling_ontology.py
+│   │   └── validators
+│   │       └── __init__.py
+│   ├── evaluation
+│   │   ├── __pycache__
+│   │   │   └── kpi.cpython-311.pyc
+│   │   └── kpi.py
+│   ├── examples
+│   │   ├── __pycache__
+│   │   │   └── scrape_ingest_and_search.cpython-311.pyc
+│   │   └── scrape_ingest_and_search.py
+│   ├── graph
+│   │   ├── __pycache__
+│   │   │   ├── graph_rag.cpython-311.pyc
+│   │   │   └── load_sample_data.cpython-311.pyc
+│   │   ├── graph_rag.py
+│   │   ├── graph_rag_adapter.py
+│   │   ├── load_sample_data.py
+│   │   └── neo4j_schema.cypher
+│   ├── ingest
+│   │   ├── __init__.py
+│   │   ├── extractors
+│   │   │   └── __init__.py
+│   │   └── loaders
+│   │       └── __init__.py
+│   ├── llm
+│   │   ├── __pycache__
+│   │   │   └── watsonx_client.cpython-311.pyc
+│   │   └── watsonx_client.py
+│   ├── loaders
+│   │   ├── __pycache__
+│   │   │   └── unified_data_loader.cpython-311.pyc
+│   │   └── unified_data_loader.py
+│   ├── main.py
+│   ├── monitoring
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-311.pyc
+│   │   │   └── workflow_monitor.cpython-311.pyc
+│   │   └── workflow_monitor.py
+│   ├── papers
+│   │   ├── __pycache__
+│   │   │   ├── paper_uploader.cpython-311.pyc
+│   │   │   └── topic_suggester.cpython-311.pyc
+│   │   ├── paper_uploader.py
+│   │   └── topic_suggester.py
+│   ├── retrieval
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   └── __init__.cpython-311.pyc
+│   │   ├── processors
+│   │   │   └── __init__.py
+│   │   └── strategies
+│   │       ├── __init__.py
+│   │       ├── __pycache__
+│   │       ├── base_strategy.py
+│   │       ├── constraint_first_strategy.py
+│   │       └── hybrid_graphrag_strategy.py
+│   ├── tests
+│   │   ├── __init__.py
+│   │   ├── integration
+│   │   │   ├── __init__.py
+│   │   │   └── test_retrieval_strategies.py
+│   │   └── unit
+│   │       ├── __init__.py
+│   │       ├── test_domain_models.py
+│   │       └── test_interfaces.py
+│   └── vector
+│       ├── __pycache__
+│       │   ├── astra_doc_ingest.cpython-311.pyc
+│       │   ├── astra_hybrid_search.cpython-311.pyc
+│       │   ├── astra_init.cpython-311.pyc
+│       │   └── doc_parsers.cpython-311.pyc
+│       ├── astra_doc_ingest.py
+│       ├── astra_hybrid_search.py
+│       ├── astra_init.py
+│       └── doc_parsers.py
+├── clients
+│   └── requests.http
+├── config
+│   └── environments
+│       ├── development.json
+│       ├── production.json
+│       └── testing.json
+├── data
+│   ├── bha_catalog.csv
+│   ├── check_neo4j_data.py
+│   ├── constraints.csv
+│   ├── demo
+│   │   └── permian
+│   │       ├── permian_formations.csv
+│   │       └── permian_wells.csv
+│   ├── docs
+│   │   ├── stick_slip.md
+│   │   └── wolfcamp.md
+│   ├── external_samples
+│   │   ├── boem_offshore_wells_sample.csv
+│   │   ├── npd_wellbores_sample.csv
+│   │   ├── rrc_texas_wells_sample.csv
+│   │   └── usgs_drilling_history_sample.csv
+│   ├── formations.csv
+│   ├── historical_plans.csv
+│   └── wells.csv
+├── enhanced_test_results.json
+├── project-structure.txt
+├── requirements.txt
+├── scripts
+│   ├── migrate_to_modular.py
+│   ├── test_conections.py
+│   ├── validate_migration.py
+│   └── validate_settings.py
+├── test_compatibility.py
+├── test_graphRAG.py
+├── test_results_partial.json
+├── test_vscode_env.py
+├── test_watsonx.py
+├── test_workflow.py
+├── well_data_loader.log
+└── workflow_logs
+
+61 directories, 134 files
